@@ -10,6 +10,7 @@ from acme.utils import counting
 from acme.utils import loggers
 from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
+from contrastive import utils as contrastive_utils
 import jax
 import jax.numpy as jnp
 import optax
@@ -22,6 +23,8 @@ from jax import random
 import os
 from default import make_default_logger
 from pathlib import Path
+import env_utils
+import imageio
 
 class TrainingState(NamedTuple):
   """Contains training state for the learner."""
@@ -71,6 +74,14 @@ class ContrastiveLearner(acme.Learner):
     self._num_sgd_steps_per_step = config.num_sgd_steps_per_step
     self._obs_dim = config.obs_dim
     self._use_td = config.use_td
+
+    self._config = config
+    self._networks = networks
+    self._last_video_step = 0
+    self._video_dir = os.path.join(
+        config.log_dir + config.alg_name + '_' + config.env_name + '_' + str(config.seed),
+        'videos')
+    os.makedirs(self._video_dir, exist_ok=True)
     
     if adaptive_entropy_coefficient:
       # alpha is the temperature parameter that determines the relative
@@ -384,6 +395,33 @@ class ContrastiveLearner(acme.Learner):
     # and fill the replay buffer.
     self._timestamp = None
 
+  def _policy_eval(self, obs, step):
+    obs = jnp.asarray(obs[None])
+    dist_params = self._networks.policy_network.apply(self._state.policy_params, obs)
+    action = self._networks.sample_eval(dist_params, jax.random.PRNGKey(step))
+    return np.asarray(action[0])
+
+  def _record_video(self, step):
+    gym_env, obs_dim, max_ep = env_utils.load(self._config.env_name)
+    goal_idx = obs_dim + contrastive_utils.obs_to_goal_1d(np.arange(obs_dim),
+                                                  self._config.start_index,
+                                                  self._config.end_index)
+    indices = np.concatenate([np.arange(obs_dim), goal_idx])
+    env = gym_env
+    frames = []
+    obs = env.reset()
+    for _ in range(max_ep):
+      frames.append(env.render(mode='rgb_array'))
+      inp = obs[indices]
+      action = self._policy_eval(inp, step)
+      obs, _, done, _ = env.step(action)
+      if done:
+        break
+    frames.append(env.render(mode='rgb_array'))
+    video_path = os.path.join(self._video_dir, f'step_{step}.mp4')
+    imageio.mimsave(video_path, frames, fps=20)
+    env.close()
+
   def step(self):
     with jax.profiler.StepTraceAnnotation('step', step_num=self._counter):
       sample = next(self._iterator)
@@ -397,6 +435,12 @@ class ContrastiveLearner(acme.Learner):
     
     # Increment counts and record the current time
     counts = self._counter.increment(steps=1, walltime=elapsed_time)
+
+    current_step = counts.get('steps', 0)
+    if (self._config.video_every_steps > 0 and
+        current_step - self._last_video_step >= self._config.video_every_steps):
+      self._record_video(current_step)
+      self._last_video_step = current_step
     
     if elapsed_time > 0:
       metrics['steps_per_second'] = (
